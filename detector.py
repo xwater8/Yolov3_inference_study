@@ -1,11 +1,15 @@
 import torch
 from torch import nn
+import numpy as np
 
 from pprint import pprint
 
 from collections import OrderedDict
 
 import pdb
+
+from torch._C import CudaBFloat16StorageBase
+from darknet import Darknet as Darknet_correct, predict_transform
 
 def parser_cfg(cfg_file):
     """
@@ -45,7 +49,65 @@ class EmptyLayer(nn.Module):
 class YoloLayer(nn.Module):
     def __init__(self, anchors):
         super(YoloLayer, self).__init__()
-        self.anchors= anchors
+        self.anchors= anchors#在416x416的圖片上面anchor的大小
+    
+    def forward(self, input_x, netHW, class_count):
+        N,C,H,W= input_x.size()
+        stride= netHW[0]//H, netHW[1]//W
+        grid_size= netHW[0]//stride[0], netHW[1]//stride[1]
+        
+        bbox_attrs= (5+class_count)
+        num_anchors= len(self.anchors)
+        #(N, anchors*box_attrs, H, W)
+        input_x= input_x.view(N, num_anchors*bbox_attrs, grid_size[0]*grid_size[1])
+        input_x= torch.transpose(input_x, 1,2).contiguous()#(N, gridH*gridW, bbox_attrs*anchors)        
+        input_x= input_x.view(N, grid_size[0]*grid_size[1]*num_anchors, bbox_attrs)#(N, gridH*gridW*anchors, bbox_attrs)
+
+        anchors= [(a[0]/stride[0], a[1]/stride[1]) for a in self.anchors]#在這張featureMap上anchor的實際大小
+        x= torch.arange(grid_size[1])
+        y= torch.arange(grid_size[0])
+        x_offset, y_offset= torch.meshgrid(x,y)
+
+        if torch.cuda.is_available():
+            x_offset= x_offset.cuda()
+            y_offset= y_offset.cuda()
+        
+        x_offset, y_offset= x_offset.view(-1, 1), y_offset.view(-1,1)
+        xy_offset= torch.cat((x_offset, y_offset), dim=1)#(gridH*gridW, 2)
+        xy_offset= xy_offset.repeat(1, num_anchors).view(-1,2).unsqueeze(0)#(gridH*gridW, 2*3)-->(1, gridH*gridW*3, 2)
+                        
+        #(tx, ty, tw, th, objectness, p1...pn)
+        input_x[:,:,0]= torch.sigmoid(input_x[:,:,0])
+        input_x[:,:,1]= torch.sigmoid(input_x[:,:,1])
+        
+        input_x[:,:,:2]+= xy_offset
+
+        input_x[:,:,4]= torch.sigmoid(input_x[:,:,4])
+
+        #W,H
+        if torch.cuda.is_available():
+            anchors= torch.FloatTensor(anchors).view(-1, 2).cuda()#(num_anchors, 2)
+        anchors= anchors.repeat(grid_size[0]*grid_size[1], 1).view(-1, 2).unsqueeze(0)#(1, gridH*gridW*3, 2)
+        input_x[:,:,2:4]= torch.exp(input_x[:,:,2:4]) * anchors
+                
+        #classes score        
+        input_x[:,:,5:]= torch.sigmoid(input_x[:,:,5:])
+
+        input_x[:,:,0]*= stride[1]#x * strideW
+        input_x[:,:,1]*= stride[0]#y * strideH
+        input_x[:,:,2]*= stride[1]#w * strideW        
+        input_x[:,:,3]*= stride[0]#h * strideH
+
+        return input_x
+
+
+
+
+
+
+
+        
+
     
 
 
@@ -55,7 +117,7 @@ def create_modules(net_modules_config):
     in_channel= 3
     output_channels= []
 
-    for layer_idx, module_config in enumerate(net_modules_config[1:]):
+    for layer_idx, module_config in enumerate(net_modules_config):
         module= nn.Sequential()
         if module_config['type']=='convolutional':
             use_batchNorm= int(module_config.get('batch_normalize', 0))
@@ -81,7 +143,7 @@ def create_modules(net_modules_config):
             
             if module_config['activation']=='leaky':
                 #Linear代表什麼都不做
-                actviation_layer= nn.LeakyReLU(inplace=True)
+                actviation_layer= nn.LeakyReLU(0.1, inplace=True)
                 module.add_module('leaky_{}'.format(layer_idx), actviation_layer)
         elif module_config['type']=='shortcut':
             #residual shortcut-skip connection            
@@ -100,7 +162,7 @@ def create_modules(net_modules_config):
 
         elif module_config['type']=='upsample':
             scale_factor= int(module_config['stride'])
-            upsample_layer= nn.Upsample(scale_factor, mode='bilinear')
+            upsample_layer= nn.Upsample(scale_factor= scale_factor, mode='nearest')
             module.add_module('upsample_{}'.format(layer_idx), upsample_layer)
             out_channel= in_channel
         elif module_config['type']=='yolo':
@@ -108,9 +170,10 @@ def create_modules(net_modules_config):
             anchors= list(map(int, module_config['anchors'].split(',')))
             layer_anchors= [(anchors[idx*2], anchors[idx*2+1]) for idx in masks]
             yolo_layer= YoloLayer(anchors= layer_anchors)
-            module.add_module('yolo_{}'.format(layer_idx), yolo_layer)
+            # module.add_module('yolo_{}'.format(layer_idx), yolo_layer)
+            module= yolo_layer
             out_channel= in_channel
-            # pdb.set_trace()
+            
 
 
         module_list.append(module)        
@@ -120,23 +183,157 @@ def create_modules(net_modules_config):
     return module_list
     
             
+
+class Darknet(nn.Module):
+    def __init__(self, cfg_file):
+        super(Darknet, self).__init__()
+        net_modules_config= parser_cfg(cfg_file)
+        self.net_info= net_modules_config[0]
+        self.net_modules_config= net_modules_config[1:]
+        self.net_modules= create_modules(self.net_modules_config)
+        self.seens= None
+    
+    def load_weights(self, weight_file):
+
+        def get_weight_move_ptr(weights, ptr, weight_param):
+            weight_count= weight_param.numel()
+            module_weight= weights[ptr: ptr+weight_count]
+            module_weight= module_weight.view_as(weight_param)#reshape as it
+            return module_weight, ptr+weight_count
+
+        with open(weight_file, 'rb')as f:
+            #1.Major version number
+            #2.Minor version number
+            #3.Subvision version number
+            #4,5: Images seen by network(during training)            #
+            headers= np.fromfile(f, dtype=np.int32, count=5)
+            self.headers= torch.from_numpy(headers)
+            self.seens= self.headers[3]
+
+            #Start to load weights
+            weights= np.fromfile(f, dtype=np.float32)
+            weights= torch.from_numpy(weights)
+            ptr= 0
+            for module_cfg, net_module in zip(self.net_modules_config, self.net_modules):
+                if module_cfg['type']!='convolutional':
+                    continue
+                #Conv module: Conv -> BN -> leaklyReLU
+                conv= net_module[0]
+                
+                use_batchNorm= int(module_cfg.get('batch_normalize', 0))
+                if use_batchNorm:
+                    batchNorm= net_module[1]
+                    #Read from files                    
+                    bn_bias, ptr= get_weight_move_ptr(weights, ptr, batchNorm.bias)                                        
+                    bn_weight, ptr= get_weight_move_ptr(weights, ptr, batchNorm.weight)                    
+                    bn_running_mean, ptr= get_weight_move_ptr(weights, ptr, batchNorm.running_mean)                    
+                    bn_running_var, ptr= get_weight_move_ptr(weights, ptr, batchNorm.running_var)
+                    
+                    #Load to module
+                    batchNorm.bias.data.copy_(bn_bias)
+                    batchNorm.weight.data.copy_(bn_weight)
+                    batchNorm.running_mean.data.copy_(bn_running_mean)
+                    batchNorm.running_var.data.copy_(bn_running_var)
+                    
+                else:                    
+                    conv_bias, ptr= get_weight_move_ptr(weights, ptr, conv.bias)
+                    conv.bias.data.copy_(conv_bias)
+
+                conv_weight, ptr= get_weight_move_ptr(weights, ptr, conv.weight)
+                conv.weight.data.copy_(conv_weight)
+                
+        return    
+
+
+
+    def forward(self, input_x):
+        N,C,H,W= input_x.size()
+
+        output_features= []
+        detections= []
+        for layer_idx, (module_cfg, net_module) in enumerate(zip(self.net_modules_config, self.net_modules)):
             
+            # if layer_idx==85:
+            #     pdb.set_trace()
+
+            if module_cfg['type']=='convolutional' or module_cfg['type']=='upsample':
+                input_x= net_module(input_x)            
+            elif module_cfg['type']=='shortcut':
+                from_layer_idx= int(module_cfg['from'])
+                input_x= output_features[-1] + output_features[from_layer_idx]                
+            elif module_cfg['type']=='route':
+                layers= module_cfg['layers'].split(',')
+                if len(layers) > 1:
+                    start, end= (int(layer) for layer in layers)                    
+                    input_x= torch.cat((output_features[start], output_features[end]), dim=1)  
+                else:
+                    start= int(layers[0])
+                    input_x= output_features[start]
+            elif module_cfg['type']=='yolo':
+                #transforms data-->BBoxes
+                netHW= int(self.net_info['height']), int(self.net_info['width'])
+                class_count= int(module_cfg['classes'])         
+                # pdb.set_trace()
+                # print(input_x)
+                # input_x= predict_transform(input_x, inp_dim= netHW[0], anchors= net_module.anchors, num_classes= class_count)
+                input_x= net_module(input_x, netHW, class_count)
+                detections.append(input_x)
+                                
+
+            output_features.append(input_x)            
+        
+        with open("handcarft.pth", 'wb')as f:
+            torch.save(output_features, f)
+
+        return torch.cat(detections, 1)
 
 
-
-            
-
+        
+        
 
 
 
 def main():
     cfg_file= './cfg/yolov3.cfg'
-    net_modules_config= parser_cfg(cfg_file)
+    weight_path= 'yolov3.weights'
+    network= Darknet(cfg_file).cuda()    
+    network_correct= Darknet_correct(cfg_file).cuda()
+    network_correct.load_weights(weight_path)
+    network.load_weights(weight_path)
+
+
+
+    network.eval()
+    network_correct.eval()
+
+    # pdb.set_trace()
+
+    # print(network)
+    data= torch.randn(1,3,416,416).cuda()
+    data2= data.clone()
+    with torch.no_grad():
+        output1= network(data)
+        output2= network_correct(data2, CUDA=True)
+
+    pdb.set_trace()
+    # for name, param in network.named_parameters():
+    #     if name=='net_modules.105.conv_105.weight':
+    #         print(param)
+    
+    # for name, param in network_correct.named_parameters():        
+    #     if 'conv_105.weight' in name:
+    #         print(param)
+
+    # for param1, param2 in zip(network.parameters(), network_correct.parameters()):
+    #     print(torch.allclose(param1, param2))
+
+    # pdb.set_trace()
+    # net_modules_config= parser_cfg(cfg_file)
     # pprint(net_modules_config)
     # print(len(net_modules_config))
+    # module_list= create_modules(net_modules_config[1:])
+    # print(module_list)
 
-    module_list= create_modules(net_modules_config)
-    print(module_list)
 
 if __name__=='__main__':
     main()
