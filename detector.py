@@ -9,7 +9,7 @@ from collections import OrderedDict
 import pdb
 
 from torch._C import CudaBFloat16StorageBase
-from darknet import Darknet as Darknet_correct, predict_transform
+# from darknet import Darknet as Darknet_correct, predict_transform
 
 def parser_cfg(cfg_file):
     """
@@ -55,7 +55,7 @@ class YoloLayer(nn.Module):
         N,C,H,W= input_x.size()
         stride= netHW[0]//H, netHW[1]//W
         grid_size= netHW[0]//stride[0], netHW[1]//stride[1]
-        
+        # pdb.set_trace()
         bbox_attrs= (5+class_count)
         num_anchors= len(self.anchors)
         #(N, anchors*box_attrs, H, W)
@@ -66,7 +66,8 @@ class YoloLayer(nn.Module):
         anchors= [(a[0]/stride[0], a[1]/stride[1]) for a in self.anchors]#在這張featureMap上anchor的實際大小
         x= torch.arange(grid_size[1])
         y= torch.arange(grid_size[0])
-        x_offset, y_offset= torch.meshgrid(x,y)
+        
+        y_offset, x_offset= torch.meshgrid(x,y)
 
         if torch.cuda.is_available():
             x_offset= x_offset.cuda()
