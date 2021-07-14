@@ -8,6 +8,32 @@ import glob
 import pdb
 import cv2
 import torchvision
+import pickle
+
+
+class BBox:
+    def __init__(self, xmin, ymin, xmax, ymax, score, clsName):
+        self.xmin= int(xmin)
+        self.ymin= int(ymin)
+        self.xmax= int(xmax)
+        self.ymax= int(ymax)
+        self.score= score
+        self.clsName= clsName
+
+        self.width= xmax-xmin
+        self.height= ymax-ymin
+    
+    def __repr__(self):
+        format_str= 'xmin={}, ymin={}, xmax={}, ymax={}, score={:.3f}, clsName={}'.format(self.xmin, self.ymin, self.xmax, self.ymax, self.score, self.clsName)
+        return format_str
+    
+    @property
+    def pt1(self):
+        return (self.xmin, self.ymin)
+    @property
+    def pt2(self):
+        return (self.xmax, self.ymax)
+        
 
 
 def parser_cfg(cfg_file):
@@ -309,7 +335,12 @@ def preprocess(img, input_size):
 
 def postprocess_bboxes(predictions, thresh= 0.5, iou_thresh= 0.4):
     """
-    predictions: (N, bboxes, bbox_attrs)
+    Args:
+        predictions: (N, bboxes, bbox_attrs)
+        thresh: objectness的門檻值
+        iou_thresh: iou小於大於此數值代表重疊率過高，濾雕分數較低的框
+    Return:
+        detection_bboxes(torch.tensor): (bbox_count, 7)=(xmin, ymin, xmax, ymax, objectness, cls_score, cls_idx)
     """    
     #Convert predictions to BBox(leftTopX, leftTopY, rightDownX, rightDownY, objectness, class_scores, class_idx)
     num_classes= predictions.size(-1) - 5
@@ -366,11 +397,61 @@ def restore_bbox_from_letterimgBBox(pred_bbox, imgHW, netHW):
 
 
 
+def bboxNumpy_to_BBox(bboxes, class_names):
+    """
+    bboxes= (xmin, ymin, xmax, ymax, objectness, cls_score, cls_idx)
+    """
+    convert_bboxes= []
+    for bbox in bboxes:
+        class_idx= int(bbox[6])
+        clsName= class_names[class_idx]
+        convert_bbox= BBox(xmin= bbox[0], ymin=bbox[1], xmax=bbox[2], ymax=bbox[3], score=bbox[5], clsName=clsName)
+        convert_bboxes.append(convert_bbox)
+    return convert_bboxes
+
+
+def load_className(class_txt):
+    class_names= []
+    with open(class_txt, 'r')as f:
+        for line in f.readlines():
+            line= line.strip()
+            class_names.append(line)
+    return class_names
+
+def load_colors(class_names, color_file):
+    color_dict= {}
+    with open(color_file, 'rb')as f:
+        colors= pickle.load(f)
+
+    for cls_name, one_color in zip(class_names, colors):
+        color_dict[cls_name]= one_color
+    return color_dict
+
+def draw_bboxes(bboxes, img, color_dict):    
+    font_face= cv2.FONT_HERSHEY_COMPLEX
+    font_scale= 0.8
+    font_thickness= 1
+        
+    for bbox in bboxes:                
+        color= color_dict[bbox.clsName]
+        cv2.rectangle(img, bbox.pt1, bbox.pt2, color, 2)        
+        (txt_w, txt_h), baseline= cv2.getTextSize(bbox.clsName, font_face, font_scale, font_thickness)
+        txt_pt1= (bbox.xmin, bbox.ymin-txt_h//2)        
+        cv2.putText(img, bbox.clsName, txt_pt1, font_face, font_scale, color, font_thickness)
+    
+    return img
+
+
 
 def main():    
     img_root= './imgs'
     cfg_file= './cfg/yolov3.cfg'
     weight_path= 'yolov3.weights'
+    class_txt_path= './data/coco.names'
+    color_file_path= './pallete'
+    class_names= load_className(class_txt_path)
+    color_dict= load_colors(class_names, color_file_path)
+    
     network= Darknet(cfg_file)
     network.load_weights(weight_path)
     network.cuda()
@@ -378,27 +459,22 @@ def main():
     
     img_paths= get_imgPaths(img_root)
     
-    for img_path in img_paths[:1]:
+    for img_path in img_paths:
         img= cv2.imread(img_path)
         img_data= preprocess(img, input_size=(416,416))
         
         with torch.no_grad():
             output= network(img_data.cuda())
                     
-        bboxes= postprocess_bboxes(output.clone(), thresh=0.5, iou_thresh=0.4)
-        bboxes= restore_bbox_from_letterimgBBox(bboxes, imgHW= img.shape[:2], netHW=(416,416))
+        bboxes_tensor= postprocess_bboxes(output, thresh=0.5, iou_thresh=0.4)
+        bboxes_tensor= restore_bbox_from_letterimgBBox(bboxes_tensor, imgHW= img.shape[:2], netHW=(416,416))
+
+        bboxes= bboxNumpy_to_BBox(bboxes_tensor, class_names)                
+        img= draw_bboxes(bboxes, img, color_dict)
                 
-        bboxes= bboxes.cpu().numpy()
-        for bbox in bboxes:
-            leftTop= int(bbox[0]), int(bbox[1])
-            rightDown= int(bbox[2]), int(bbox[3])
-            cv2.rectangle(img, leftTop, rightDown, (0,255,0), 2)
         cv2.imshow("Draw", img)
         cv2.waitKey()
     
-        
-
-
 
 if __name__=='__main__':
     main()
