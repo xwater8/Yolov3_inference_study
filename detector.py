@@ -1,15 +1,14 @@
+import os
 import torch
 from torch import nn
 import numpy as np
-
 from pprint import pprint
-
 from collections import OrderedDict
-
+import glob
 import pdb
+import cv2
+import torchvision
 
-from torch._C import CudaBFloat16StorageBase
-# from darknet import Darknet as Darknet_correct, predict_transform
 
 def parser_cfg(cfg_file):
     """
@@ -55,7 +54,7 @@ class YoloLayer(nn.Module):
         N,C,H,W= input_x.size()
         stride= netHW[0]//H, netHW[1]//W
         grid_size= netHW[0]//stride[0], netHW[1]//stride[1]
-        # pdb.set_trace()
+        
         bbox_attrs= (5+class_count)
         num_anchors= len(self.anchors)
         #(N, anchors*box_attrs, H, W)
@@ -253,10 +252,7 @@ class Darknet(nn.Module):
         output_features= []
         detections= []
         for layer_idx, (module_cfg, net_module) in enumerate(zip(self.net_modules_config, self.net_modules)):
-            
-            # if layer_idx==85:
-            #     pdb.set_trace()
-
+                        
             if module_cfg['type']=='convolutional' or module_cfg['type']=='upsample':
                 input_x= net_module(input_x)            
             elif module_cfg['type']=='shortcut':
@@ -274,66 +270,134 @@ class Darknet(nn.Module):
                 #transforms data-->BBoxes
                 netHW= int(self.net_info['height']), int(self.net_info['width'])
                 class_count= int(module_cfg['classes'])         
-                # pdb.set_trace()
-                # print(input_x)
-                # input_x= predict_transform(input_x, inp_dim= netHW[0], anchors= net_module.anchors, num_classes= class_count)
+                
                 input_x= net_module(input_x, netHW, class_count)
                 detections.append(input_x)
                                 
 
             output_features.append(input_x)            
         
-        with open("handcarft.pth", 'wb')as f:
-            torch.save(output_features, f)
-
+        
         return torch.cat(detections, 1)
 
 
+def letterbox_img(img, input_size):
+    target_w, target_h= input_size
+    
+    img_h, img_w= img.shape[0], img.shape[1]
+    min_aspect_ratio= min(target_w/img_w, target_h/img_h)
+    
+    new_h, new_w= int(img_h * min_aspect_ratio), int(img_w * min_aspect_ratio)
+    resize_img= cv2.resize(img, (new_w, new_h))
+    
+    output_img= np.full((target_h, target_w, 3), 128,dtype=np.uint8)
+    padding_h= (target_h - new_h)//2
+    padding_w= (target_w - new_w)//2
+    
+    output_img[padding_h:padding_h+new_h, padding_w:padding_w+new_w]= resize_img
+    return output_img
+    
+
+def preprocess(img, input_size):
+    img= letterbox_img(img, input_size)    
+    img_data= cv2.cvtColor(img, cv2.COLOR_BGR2RGB)    
+    img_data= img_data.astype(np.float32)/255.0    
+    img_data= torch.from_numpy(img_data).permute(2,0,1).unsqueeze(0)
+    return img_data
+
+
+
+def postprocess_bboxes(predictions, thresh= 0.5, iou_thresh= 0.4):
+    """
+    predictions: (N, bboxes, bbox_attrs)
+    """    
+    #Convert predictions to BBox(leftTopX, leftTopY, rightDownX, rightDownY, objectness, class_scores, class_idx)
+    num_classes= predictions.size(-1) - 5
+    bbox_corner= predictions[:,:,:4].clone()
+    predictions[:,:,0]= (bbox_corner[:,:,0] - bbox_corner[:,:,2]/2.0)#lt_x
+    predictions[:,:,1]= (bbox_corner[:,:,1] - bbox_corner[:,:,3]/2.0)#lt_y
+    predictions[:,:,2]= (bbox_corner[:,:,0] + bbox_corner[:,:,2]/2.0)#rd_x
+    predictions[:,:,3]= (bbox_corner[:,:,1] + bbox_corner[:,:,3]/2.0)#rd_y
+           
+    
+    for batch_idx in range(predictions.size(0)):
+        pred_tensor= predictions[batch_idx]             
+        pred_tensor= pred_tensor[pred_tensor[:,4] >thresh]#Filter by ojbectness
+        pred_tensor[:,:2]= torch.clamp(pred_tensor[:,:2], min=0)
+        max_score, max_score_idx= torch.max(pred_tensor[:,5:].view(-1, num_classes), dim=1)#values, idx                
         
+        max_score= max_score.unsqueeze(-1)        
+        max_score_idx= max_score_idx.unsqueeze(-1)        
+        pred_tensor= torch.cat((pred_tensor[:,:5], max_score, max_score_idx), dim=-1)
+
+        bbox_coord= pred_tensor[:,:4]
+        scores= pred_tensor[:,-2]
+        class_idxs= pred_tensor[:,-1]
+        keep_idxs= torchvision.ops.batched_nms(bbox_coord, scores, class_idxs, iou_threshold= iou_thresh)      
+        detection_bboxes= pred_tensor[keep_idxs]
+            
+    return detection_bboxes
+            
         
 
+def get_imgPaths(img_root):
+    img_paths= glob.glob(os.path.join(img_root, '*.jpg'))
+    return sorted(img_paths)
 
 
-def main():
+def restore_bbox_from_letterimgBBox(pred_bbox, imgHW, netHW):
+    """
+    預測出來的pred_bbox是在letterimg上, 我們要將座標還原回原圖
+    pred_bbox(Tensor): 從yolo網路裡面預測出來的bbox(經過letterbox處理的圖片上)
+    imgHW: 原圖的imgSize
+    netHW: 輸入network的圖片大小
+    """
+    scale_factor= min(netHW[0]/imgHW[0], netHW[1]/imgHW[1])
+    padH= (netHW[0] - imgHW[0] * scale_factor)/2
+    padW= (netHW[1] - imgHW[1] * scale_factor)/2
+    
+    pred_bbox[:, 0]-=padW#leftTopX
+    pred_bbox[:, 2]-=padW#rightDownX
+    pred_bbox[:, 1]-=padH#leftTopY
+    pred_bbox[:, 3]-=padH#rightDownY
+    pred_bbox[:, :4]/=scale_factor
+    return pred_bbox
+
+
+
+
+
+def main():    
+    img_root= './imgs'
     cfg_file= './cfg/yolov3.cfg'
     weight_path= 'yolov3.weights'
-    network= Darknet(cfg_file).cuda()    
-    network_correct= Darknet_correct(cfg_file).cuda()
-    network_correct.load_weights(weight_path)
+    network= Darknet(cfg_file)
     network.load_weights(weight_path)
-
-
-
+    network.cuda()
     network.eval()
-    network_correct.eval()
-
-    # pdb.set_trace()
-
-    # print(network)
-    data= torch.randn(1,3,416,416).cuda()
-    data2= data.clone()
-    with torch.no_grad():
-        output1= network(data)
-        output2= network_correct(data2, CUDA=True)
-
-    pdb.set_trace()
-    # for name, param in network.named_parameters():
-    #     if name=='net_modules.105.conv_105.weight':
-    #         print(param)
     
-    # for name, param in network_correct.named_parameters():        
-    #     if 'conv_105.weight' in name:
-    #         print(param)
+    img_paths= get_imgPaths(img_root)
+    
+    for img_path in img_paths[:1]:
+        img= cv2.imread(img_path)
+        img_data= preprocess(img, input_size=(416,416))
+        
+        with torch.no_grad():
+            output= network(img_data.cuda())
+                    
+        bboxes= postprocess_bboxes(output.clone(), thresh=0.5, iou_thresh=0.4)
+        bboxes= restore_bbox_from_letterimgBBox(bboxes, imgHW= img.shape[:2], netHW=(416,416))
+                
+        bboxes= bboxes.cpu().numpy()
+        for bbox in bboxes:
+            leftTop= int(bbox[0]), int(bbox[1])
+            rightDown= int(bbox[2]), int(bbox[3])
+            cv2.rectangle(img, leftTop, rightDown, (0,255,0), 2)
+        cv2.imshow("Draw", img)
+        cv2.waitKey()
+    
+        
 
-    # for param1, param2 in zip(network.parameters(), network_correct.parameters()):
-    #     print(torch.allclose(param1, param2))
-
-    # pdb.set_trace()
-    # net_modules_config= parser_cfg(cfg_file)
-    # pprint(net_modules_config)
-    # print(len(net_modules_config))
-    # module_list= create_modules(net_modules_config[1:])
-    # print(module_list)
 
 
 if __name__=='__main__':
