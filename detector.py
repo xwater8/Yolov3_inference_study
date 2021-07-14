@@ -392,6 +392,10 @@ def restore_bbox_from_letterimgBBox(pred_bbox, imgHW, netHW):
     pred_bbox[:, 1]-=padH#leftTopY
     pred_bbox[:, 3]-=padH#rightDownY
     pred_bbox[:, :4]/=scale_factor
+
+    pred_bbox[:, [0,2]]= torch.clamp(pred_bbox[:, [0,2]], min=0, max=imgHW[1])
+    pred_bbox[:, [1,3]]= torch.clamp(pred_bbox[:, [1,3]], min=0, max=imgHW[0])
+
     return pred_bbox
 
 
@@ -449,6 +453,9 @@ def main():
     weight_path= 'yolov3.weights'
     class_txt_path= './data/coco.names'
     color_file_path= './pallete'
+    output_root= './detect_result'
+    os.makedirs(output_root, exist_ok=True)
+
     class_names= load_className(class_txt_path)
     color_dict= load_colors(class_names, color_file_path)
     
@@ -471,7 +478,9 @@ def main():
 
         bboxes= bboxNumpy_to_BBox(bboxes_tensor, class_names)                
         img= draw_bboxes(bboxes, img, color_dict)
-                
+        
+        output_path= os.path.join(output_root, os.path.basename(img_path))
+        cv2.imwrite(output_path, img)
         cv2.imshow("Draw", img)
         cv2.waitKey()
     
