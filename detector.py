@@ -398,11 +398,13 @@ def postprocess_bboxes(predictions, thresh= 0.5, iou_thresh= 0.4):
     for batch_idx in range(predictions.size(0)):
         pred_tensor= predictions[batch_idx]             
         pred_tensor= pred_tensor[pred_tensor[:,4] >thresh]#Filter by ojbectness
+        
         pred_tensor[:,:2]= torch.clamp(pred_tensor[:,:2], min=0)
         max_score, max_score_idx= torch.max(pred_tensor[:,5:].view(-1, num_classes), dim=1)#values, idx                
         
         max_score= max_score.unsqueeze(-1)        
-        max_score_idx= max_score_idx.unsqueeze(-1)        
+        max_score_idx= max_score_idx.unsqueeze(-1)   
+        
         pred_tensor= torch.cat((pred_tensor[:,:5], max_score, max_score_idx), dim=-1)
 
         bbox_coord= pred_tensor[:,:4]
@@ -429,6 +431,8 @@ def postprocess_bboxes(predictions, thresh= 0.5, iou_thresh= 0.4):
             detection_bboxes.append(nms_pred_tensor)
         if len(detection_bboxes)>0:            
             detection_bboxes= torch.cat(detection_bboxes)
+        else:
+            detection_bboxes= pred_tensor.clone()#tensor([], size=(0,85))
         
     return detection_bboxes
             
@@ -537,12 +541,7 @@ def main():
         with torch.no_grad():
             output= network(img_data.cuda())
                     
-        bboxes_tensor= postprocess_bboxes(output, thresh=0.5, iou_thresh=0.4)        
-        if isinstance(bboxes_tensor, list):
-            output_path= os.path.join(output_root, os.path.basename(img_path))
-            cv2.imwrite(output_path, img)
-            continue
-
+        bboxes_tensor= postprocess_bboxes(output, thresh=0.5, iou_thresh=0.4)                        
         bboxes_tensor= restore_bbox_from_letterimgBBox(bboxes_tensor, imgHW= img.shape[:2], netHW=(416,416))
 
         bboxes= bboxNumpy_to_BBox(bboxes_tensor, class_names)                
