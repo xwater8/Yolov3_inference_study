@@ -4,3 +4,7 @@ https://github.com/ayooshkathuria/YOLO_v3_tutorial_from_scratch
 
 yolov3.weights下載點:
 wget https://pjreddie.com/media/files/yolov3.weights 
+
+
+此Code目前運作在Windows上
+torch: 1.9.0
