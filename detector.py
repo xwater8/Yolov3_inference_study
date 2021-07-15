@@ -394,7 +394,7 @@ def postprocess_bboxes(predictions, thresh= 0.5, iou_thresh= 0.4):
     predictions[:,:,2]= (bbox_corner[:,:,0] + bbox_corner[:,:,2]/2.0)#rd_x
     predictions[:,:,3]= (bbox_corner[:,:,1] + bbox_corner[:,:,3]/2.0)#rd_y
            
-    
+    batch_detection_bboxes= []
     for batch_idx in range(predictions.size(0)):
         pred_tensor= predictions[batch_idx]             
         pred_tensor= pred_tensor[pred_tensor[:,4] >thresh]#Filter by ojbectness
@@ -433,8 +433,12 @@ def postprocess_bboxes(predictions, thresh= 0.5, iou_thresh= 0.4):
             detection_bboxes= torch.cat(detection_bboxes)
         else:
             detection_bboxes= pred_tensor.clone()#tensor([], size=(0,85))
+        batch_idxs= detection_bboxes.new(detection_bboxes.size(0), 1)        
+        batch_idxs[:,0]= batch_idx
+        batchId_detection_bboxes= torch.cat([batch_idxs, detection_bboxes], dim=-1)
+        batch_detection_bboxes.append(batchId_detection_bboxes)
         
-    return detection_bboxes
+    return torch.cat(batch_detection_bboxes, dim=0)
             
         
 
@@ -514,6 +518,17 @@ def draw_bboxes(bboxes, img, color_dict):
     return img
 
 
+def generator_batchImgPaths(img_paths, batch_size=1):
+    batch_imgPath= []
+    for img_path in img_paths:
+        batch_imgPath.append(img_path)
+        if len(batch_imgPath)==batch_size:
+            yield batch_imgPath
+            batch_imgPath.clear()
+    
+    if len(batch_imgPath)>0:
+        yield batch_imgPath
+
 
 def main():    
     img_root= './imgs'
@@ -522,6 +537,7 @@ def main():
     class_txt_path= './data/coco.names'
     color_file_path= './pallete'
     output_root= './detect_result'
+    batch_size=5
     os.makedirs(output_root, exist_ok=True)
 
     class_names= load_className(class_txt_path)
@@ -534,23 +550,27 @@ def main():
     
     img_paths= get_imgPaths(img_root)
     
-    for img_path in img_paths:
-        img= cv2.imread(img_path)
-        img_data= preprocess(img, input_size=(416,416))
+    for batch_img_path in generator_batchImgPaths(img_paths, batch_size= batch_size):
+        imgs= [cv2.imread(img_path) for img_path in batch_img_path]
+        img_data= [preprocess(img, input_size=(416,416)) for img in imgs]        
+        img_data= torch.cat(img_data, dim=0)        
         
         with torch.no_grad():
             output= network(img_data.cuda())
-                    
-        bboxes_tensor= postprocess_bboxes(output, thresh=0.5, iou_thresh=0.4)                        
-        bboxes_tensor= restore_bbox_from_letterimgBBox(bboxes_tensor, imgHW= img.shape[:2], netHW=(416,416))
-
-        bboxes= bboxNumpy_to_BBox(bboxes_tensor, class_names)                
-        img= draw_bboxes(bboxes, img, color_dict)
         
-        output_path= os.path.join(output_root, os.path.basename(img_path))
-        cv2.imwrite(output_path, img)
-        cv2.imshow("Draw", img)
-        cv2.waitKey()
+        batch_bboxes_tensor= postprocess_bboxes(output, thresh=0.5, iou_thresh=0.4)
+        for batch_id, (img, img_path) in enumerate(zip(imgs, batch_img_path)):            
+            mask= (batch_bboxes_tensor[:,0]==batch_id)
+            bboxes_tensor= batch_bboxes_tensor[mask][:,1:]#去掉開頭的batch_idx
+            bboxes_tensor= restore_bbox_from_letterimgBBox(bboxes_tensor, imgHW= img.shape[:2], netHW=(416,416))
+
+            bboxes= bboxNumpy_to_BBox(bboxes_tensor, class_names)                
+            img= draw_bboxes(bboxes, img, color_dict)
+        
+            output_path= os.path.join(output_root, os.path.basename(img_path))
+            cv2.imwrite(output_path, img)
+            cv2.imshow("Draw", img)
+            cv2.waitKey()
     
 
 if __name__=='__main__':
