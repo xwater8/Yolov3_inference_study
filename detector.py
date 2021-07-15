@@ -8,6 +8,7 @@ import glob
 import pdb
 import cv2
 import torchvision
+import time
 import pickle
 
 
@@ -551,6 +552,7 @@ def main():
     img_paths= get_imgPaths(img_root)
     
     for batch_img_path in generator_batchImgPaths(img_paths, batch_size= batch_size):
+        start_t_batch= time.time()
         imgs= [cv2.imread(img_path) for img_path in batch_img_path]
         img_data= [preprocess(img, input_size=(416,416)) for img in imgs]        
         img_data= torch.cat(img_data, dim=0)        
@@ -569,8 +571,12 @@ def main():
         
             output_path= os.path.join(output_root, os.path.basename(img_path))
             cv2.imwrite(output_path, img)
-            cv2.imshow("Draw", img)
-            cv2.waitKey()
+            # cv2.imshow("Draw", img)
+            # cv2.waitKey()
+        
+        torch.cuda.synchronize()
+        fps= (time.time() - start_t_batch) / len(batch_img_path)
+        print("Process batch imgs: {}".format(fps))
     
 
 if __name__=='__main__':
