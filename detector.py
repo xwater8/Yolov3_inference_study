@@ -333,6 +333,50 @@ def preprocess(img, input_size):
 
 
 
+def IoUs(bboxes):
+    inter_xmin= torch.maximum(bboxes[0,0], bboxes[:,0])
+    inter_ymin= torch.maximum(bboxes[0,1], bboxes[:,1])
+    inter_xmax= torch.minimum(bboxes[0,2], bboxes[:,2])    
+    inter_ymax= torch.minimum(bboxes[0,3], bboxes[:,3])
+
+    inter_diffx= torch.clamp(inter_xmax - inter_xmin, min=0)
+    inter_diffy= torch.clamp(inter_ymax - inter_ymin, min=0)
+
+    inter_area= inter_diffx * inter_diffy
+    
+    area_bboxes= (bboxes[:,2]-bboxes[:,0])*(bboxes[:,3]-bboxes[:,1])
+    
+    ious= inter_area / (area_bboxes[0]+area_bboxes - inter_area)
+    return ious
+    
+
+
+def nms(bboxes_tensor, iou_thresh):
+    """
+    bboxes_tensor:只有指定某一個類別的所有bboxes進行NMS
+    """
+    scores= bboxes_tensor[:, -2]
+    sort_idx= torch.argsort(scores, descending=True)
+    keep_idxs= []
+    
+    while sort_idx.numel() > 0:
+        
+        #Computer ious        
+        bboxes= bboxes_tensor[sort_idx]
+        keep_idxs.append(sort_idx[0])
+
+        ious= IoUs(bboxes)
+        sort_idx= sort_idx[ious<iou_thresh]
+    
+    return keep_idxs
+
+    
+
+
+    
+
+
+
 def postprocess_bboxes(predictions, thresh= 0.5, iou_thresh= 0.4):
     """
     Args:
@@ -364,9 +408,28 @@ def postprocess_bboxes(predictions, thresh= 0.5, iou_thresh= 0.4):
         bbox_coord= pred_tensor[:,:4]
         scores= pred_tensor[:,-2]
         class_idxs= pred_tensor[:,-1]
-        keep_idxs= torchvision.ops.batched_nms(bbox_coord, scores, class_idxs, iou_threshold= iou_thresh)      
-        detection_bboxes= pred_tensor[keep_idxs]
+        # keep_idxs= torchvision.ops.batched_nms(bbox_coord, scores, class_idxs, iou_threshold= iou_thresh)      
+        # detection_bboxes= pred_tensor[keep_idxs]
+
+        class_idxs= torch.unique(class_idxs)
+        detection_bboxes= []
+        for class_id in class_idxs:
+            class_mask= (pred_tensor[:, -1]==class_id)
+            class_pred_tensor= pred_tensor[class_mask]
+            keep_idxs= nms(class_pred_tensor, iou_thresh)                   
+            keep_idxs= torch.tensor(keep_idxs)#需轉成tensor才可使用torch.index_select
+            if class_pred_tensor.is_cuda: 
+                keep_idxs= keep_idxs.cuda()
+
+            #直接使用會有問題class_pred_tensor[keep_idxs].view(-1, 7)
+            #若keep_idxs >=2, 會取得class_pred_tensor[keep_idxs[0], keep_idxs[1]]
+            #因此改用index_select
+            nms_pred_tensor= torch.index_select(class_pred_tensor, dim=0, index=keep_idxs)
             
+            detection_bboxes.append(nms_pred_tensor)
+        if len(detection_bboxes)>0:            
+            detection_bboxes= torch.cat(detection_bboxes)
+        
     return detection_bboxes
             
         
@@ -383,6 +446,7 @@ def restore_bbox_from_letterimgBBox(pred_bbox, imgHW, netHW):
     imgHW: 原圖的imgSize
     netHW: 輸入network的圖片大小
     """
+    
     scale_factor= min(netHW[0]/imgHW[0], netHW[1]/imgHW[1])
     padH= (netHW[0] - imgHW[0] * scale_factor)/2
     padW= (netHW[1] - imgHW[1] * scale_factor)/2
@@ -473,7 +537,12 @@ def main():
         with torch.no_grad():
             output= network(img_data.cuda())
                     
-        bboxes_tensor= postprocess_bboxes(output, thresh=0.5, iou_thresh=0.4)
+        bboxes_tensor= postprocess_bboxes(output, thresh=0.5, iou_thresh=0.4)        
+        if isinstance(bboxes_tensor, list):
+            output_path= os.path.join(output_root, os.path.basename(img_path))
+            cv2.imwrite(output_path, img)
+            continue
+
         bboxes_tensor= restore_bbox_from_letterimgBBox(bboxes_tensor, imgHW= img.shape[:2], netHW=(416,416))
 
         bboxes= bboxNumpy_to_BBox(bboxes_tensor, class_names)                
